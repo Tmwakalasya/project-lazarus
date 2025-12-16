@@ -1,0 +1,55 @@
+services:
+  # 1. Database for Airflow (Internal Metadata)
+  postgres-airflow:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  # 2. PROD Database
+  postgres-prod:
+    image: postgres:13
+    container_name: postgres-prod
+    environment:
+      - POSTGRES_USER=${PROD_USER}
+      - POSTGRES_PASSWORD=${PROD_PW}
+      - POSTGRES_DB=${PROD_DB}
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./backups:/tmp/backups
+
+  # 3. Airflow (The Chef/Orchestrator)
+  airflow-standalone:
+    build: .
+    container_name: airflow-lazarus
+    command: airflow standalone
+    ports:
+      - "8080:8080"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - PROD_DB_USER=${PROD_USER}
+      - PROD_DB_PASS=${PROD_PW}
+      - PROD_DB_NAME=${PROD_DB}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./backups:/opt/airflow/backups
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: root
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
