@@ -37,7 +37,7 @@ TEMP_DB_CONFIG = {
     "password": PROD_PASSWORD,
 }
 
-QUERY = "SELECT COUNT(*) FROM top_secret_users;"
+QUERY = "SELECT COUNT(*) FROM public.top_secret_users;"
 
 
 # --- PYTHON LOGIC ---
@@ -94,6 +94,24 @@ with DAG(
             "simulate_corruption": Param(False, type="boolean", description="Inject corruption into backup file?"),
         }
 ) as dag:
+
+
+    # 0. Initialize PROD with deterministic test data
+    init_prod_task = BashOperator(
+        task_id="0_init_prod_data",
+        bash_command=(
+            f'docker exec -i postgres-prod psql -v ON_ERROR_STOP=1 -U {PROD_USER} -d {PROD_DBNAME} -c "'
+            'CREATE TABLE IF NOT EXISTS public.top_secret_users ('
+            'id SERIAL PRIMARY KEY, '
+            'username TEXT NOT NULL, '
+            'role TEXT NOT NULL'
+            '); '
+            'TRUNCATE public.top_secret_users; '
+            "INSERT INTO public.top_secret_users (username, role) VALUES "
+            "('Alice','admin'),('Bob','user'),('Carol','auditor');"
+            '"'
+        )
+    )
 
     # 1. Backup Production
     backup_task = BashOperator(
@@ -152,7 +170,7 @@ with DAG(
         trigger_rule='all_done'
     )
 
-    backup_task >> branch_task
+    init_prod_task >> backup_task >> branch_task
     branch_task >> sabotage_task >> spin_up_task
     branch_task >> spin_up_task
     spin_up_task >> wait_task >> restore_task >> verify_task >> teardown_task
