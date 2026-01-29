@@ -37,8 +37,12 @@ TEMP_DB_CONFIG = {
     "password": PROD_PASSWORD,
 }
 
-QUERY = "SELECT COUNT(*) FROM public.top_secret_users;"
+COUNT_QUERY = "SELECT COUNT(*) FROM public.top_secret_users;"
 
+HASH_QUERY = """
+SELECT md5(string_agg(md5(row(t.*)::text), '' ORDER BY id)) AS table_hash
+FROM public.top_secret_users t;
+"""
 
 # --- PYTHON LOGIC ---
 def check_integrity(**context):
@@ -46,31 +50,39 @@ def check_integrity(**context):
     try:
         conn_prod = psycopg2.connect(**PROD_DB_CONFIG)
         cursor_prod = conn_prod.cursor()
-        cursor_prod.execute(QUERY)
+        cursor_prod.execute(COUNT_QUERY)
         prod_count = cursor_prod.fetchone()[0]
+        cursor_prod.execute(HASH_QUERY)
+        prod_hash = cursor_prod.fetchone()[0]
         print(f"Production rows: {prod_count}")
+        print(f"Production hash: {prod_hash}")
         conn_prod.close()
     except Exception as e:
-        print(f" ERROR connecting to PROD: {e}")
+        print(f"ERROR connecting to PROD: {e}")
         raise e
 
     # 2. Inspect Replica
     try:
         conn_temp = psycopg2.connect(**TEMP_DB_CONFIG)
         cursor_temp = conn_temp.cursor()
-        cursor_temp.execute(QUERY)
+        cursor_temp.execute(COUNT_QUERY)
         temp_count = cursor_temp.fetchone()[0]
+        cursor_temp.execute(HASH_QUERY)
+        temp_hash = cursor_temp.fetchone()[0]
         print(f"Replica rows: {temp_count}")
+        print(f"Replica hash: {temp_hash}")
         conn_temp.close()
     except Exception as e:
-        print(f" ERROR connecting to TEMP: {e}")
+        print(f"ERROR connecting to TEMP: {e}")
         raise e
 
-    # 3. Verify the two replicas
+    # 3. Mathematical verification (counts + checksums)
     if prod_count != temp_count:
-        raise ValueError(f" INTEGRITY FAILURE! Prod: {prod_count} != Temp: {temp_count}")
+        raise ValueError(f"ROW COUNT MISMATCH! Prod={prod_count} Temp={temp_count}")
+    if prod_hash != temp_hash:
+        raise ValueError(f"CHECKSUM MISMATCH! Prod={prod_hash} Temp={temp_hash}")
+    print("Mathematical integrity check passed (row count + checksum).")
 
-    print(" Integrity check passed.")
 
 def decide_corruption(**context):
     should_corrupt = context['params']['simulate_corruption']
@@ -145,7 +157,7 @@ with DAG(
             -e POSTGRES_DB={PROD_DBNAME} \
             postgres:13
         ''',
-        trigger_rule='one_success'
+        trigger_rule='none_failed_min_one_success'
     )
 
     wait_task = BashOperator(
@@ -174,11 +186,3 @@ with DAG(
     branch_task >> sabotage_task >> spin_up_task
     branch_task >> spin_up_task
     spin_up_task >> wait_task >> restore_task >> verify_task >> teardown_task
-
-
-
-
-
-
-
-
