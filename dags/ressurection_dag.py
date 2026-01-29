@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 # --- CONFIGURATION ---
-HOST_BACKUP_PATH = "/Users/tuntufyemwakalasya/PycharmProjects/project-lazarus/backups"
+HOST_BACKUP_PATH = "/opt/airflow/backups"
 INTERNAL_BACKUP_PATH = "/opt/airflow/backups/integrity_test.sql"
 TEMP_CONTAINER_NAME = "lazarus-temp-db"
 
