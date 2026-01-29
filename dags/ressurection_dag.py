@@ -5,6 +5,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models.param import Param
 from datetime import datetime
+import hashlib
 
 
 # --- CONFIGURATION ---
@@ -74,6 +75,12 @@ def check_integrity(**context):
 
     print(" Integrity check passed.")
 
+def hash_function(data):
+    input_bytes = data.encode('utf-8')
+    hash_object = hashlib.sha256(input_bytes)
+    hex_digest = hash_object.hexdigest()
+
+    return hex_digest
 
 def cryptographic_integrity_check(row_count):
     # 1. Create a matrix to hold row hash
@@ -99,7 +106,7 @@ def cryptographic_integrity_check(row_count):
                 row_text += str(col)
             
             row_text.replace(" ", "")
-            hashes[i][0] = row_text  
+            hashes[i][0] = hash_function(row_text)
             i+=1
 
         conn_prod.close()
@@ -124,7 +131,7 @@ def cryptographic_integrity_check(row_count):
                 row_text += str(col)
             
             row_text.replace(" ", "")
-            hashes[i][1] = row_text
+            hashes[i][1] = hash_function(row_text)
             i+=1
 
         conn_temp.close()
