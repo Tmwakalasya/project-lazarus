@@ -147,8 +147,11 @@ def cryptographic_integrity_check(row_count):
 
 def decide_corruption(**context):
     should_corrupt = context['params']['simulate_corruption']
+    should_corrupt_data = context['params']['simulate_internal_data_corruption']
     if should_corrupt:
         return "sabotage_backup"
+    elif should_corrupt_data:
+        return "sabotage_backup_data"
     else:
         return "2_spin_up_temp"
 
@@ -165,6 +168,7 @@ with DAG(
         catchup=False,
         params={
             "simulate_corruption": Param(False, type="boolean", description="Inject corruption into backup file?"),
+            "simulate_internal_data_corruption": Param(False, type="boolean", description="Corrupt data within backup file?"),
         }
 ) as dag:
 
@@ -186,6 +190,12 @@ with DAG(
     sabotage_task = BashOperator(
         task_id='sabotage_backup',
         bash_command=f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL_DATA\', \'spy\');" >> {INTERNAL_BACKUP_PATH}'
+    )
+
+    # 3d. Sabotage Data Task
+    sabotage_data_task = BashOperator(
+        task_id='sabotage_backup_data',
+        bash_command=f'echo "UPDATE public.top_secret_users SET role = \'engineer\' WHERE username = \'hacker_harry\';" >> {INTERNAL_BACKUP_PATH}'
     )
 
     # 4. Spin Up Temp DB
@@ -227,13 +237,6 @@ with DAG(
 
     backup_task >> branch_task
     branch_task >> sabotage_task >> spin_up_task
+    branch_task >> sabotage_data_task >> spin_up_task
     branch_task >> spin_up_task
     spin_up_task >> wait_task >> restore_task >> verify_task >> teardown_task
-
-
-
-
-
-
-
-
