@@ -192,7 +192,7 @@ with DAG(
         bash_command=f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL_DATA\', \'spy\');" >> {INTERNAL_BACKUP_PATH}'
     )
 
-    # 3d. Sabotage Data Task
+    # 3b. Sabotage Data Task
     sabotage_data_task = BashOperator(
         task_id='sabotage_backup_data',
         bash_command=f'echo "UPDATE public.top_secret_users SET role = \'engineer\' WHERE username = \'hacker_harry\';" >> {INTERNAL_BACKUP_PATH}'
