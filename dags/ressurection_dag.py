@@ -1,10 +1,13 @@
 import os
+from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 import psycopg2
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models.param import Param
 from datetime import datetime
+import json
+import urllib.request
 
 
 # --- CONFIGURATION ---
@@ -96,12 +99,42 @@ default_args = {
     "retries": 0
 }
 
+def notify_slack_on_failure(context):
+    webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook:
+        print("SLACK_WEBHOOK_URL not set, skipping Slack notification.")
+        return
+    ti = context.get("task_instance")
+    dag_id = context.get("dag").dag_id if context.get("dag") else "unknown_dag"
+    task_id = ti.task_id if ti else "unknown_task"
+    run_id = context.get("run_id", "unknown_run")
+    exc = context.get("exception")
+    log_url = ti.log_url if ti else ""
+    msg = (
+        f":rotating_light: Lazarus verification failed\n"
+        f"DAG: {dag_id}\n"
+        f"Task: {task_id}\n"
+        f"Run: {run_id}\n"
+        f"Error: {exc}\n"
+        f"Logs: {log_url}"
+)
+
+    data = json.dumps({"text": msg}).encode("utf-8")
+    req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"}, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"Slack webhook status: {resp.status}")
+    except Exception as e:
+        print(f"Failed to send Slack notification: {e}")
+
 with DAG(
         dag_id='project_lazarus_verifier',
         default_args=default_args,
         start_date=datetime(2023, 1, 1),
         schedule_interval=None,
         catchup=False,
+        on_failure_callback=notify_slack_on_failure,
         params={
             "simulate_corruption": Param(False, type="boolean", description="Inject corruption into backup file?"),
         }
@@ -112,11 +145,16 @@ with DAG(
     init_prod_task = BashOperator(
         task_id="0_init_prod_data",
         bash_command=(
-            f'docker exec -i postgres-prod psql -v ON_ERROR_STOP=1 -U {PROD_USER} -d {PROD_DBNAME} -c "'
+            f'PGPASSWORD={PROD_PASSWORD} psql '
+            f'-h postgres-prod '
+            f'-U {PROD_USER} '
+            f'-d {PROD_DBNAME} '
+            f'-v ON_ERROR_STOP=1 '
+            f'-c "'
             'CREATE TABLE IF NOT EXISTS public.top_secret_users ('
-            'id SERIAL PRIMARY KEY, '
-            'username TEXT NOT NULL, '
-            'role TEXT NOT NULL'
+                'id SERIAL PRIMARY KEY, '
+                'username TEXT NOT NULL, '
+                'role TEXT NOT NULL'
             '); '
             'TRUNCATE public.top_secret_users; '
             "INSERT INTO public.top_secret_users (username, role) VALUES "
@@ -172,9 +210,10 @@ with DAG(
     )
 
     verify_task = PythonOperator(
-        task_id='5_verify_integrity',
-        python_callable=check_integrity
-    )
+    task_id='5_verify_integrity',
+    python_callable=check_integrity,
+    on_failure_callback=notify_slack_on_failure
+)
 
     teardown_task = BashOperator(
         task_id='6_teardown',

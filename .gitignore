@@ -1,0 +1,7 @@
+
+# local/dev artifacts
+.env
+logs/
+backups/
+dags/__pycache__/
+__pycache__/

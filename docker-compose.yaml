@@ -40,6 +40,7 @@ services:
       - PROD_DB_USER=${PROD_USER}
       - PROD_DB_PASS=${PROD_PW}
       - PROD_DB_NAME=${PROD_DB}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
