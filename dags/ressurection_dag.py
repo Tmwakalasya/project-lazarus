@@ -8,6 +8,7 @@ from airflow.models.param import Param
 from datetime import datetime
 import json
 import urllib.request
+import hashlib
 
 
 # --- CONFIGURATION ---
@@ -85,6 +86,78 @@ def check_integrity(**context):
     if prod_hash != temp_hash:
         raise ValueError(f"CHECKSUM MISMATCH! Prod={prod_hash} Temp={temp_hash}")
     print("Mathematical integrity check passed (row count + checksum).")
+
+
+    cryptographic_integrity_check(prod_count)
+
+def hash_function(data):
+    input_bytes = data.encode('utf-8')
+    hash_object = hashlib.sha256(input_bytes)
+    hex_digest = hash_object.hexdigest()
+
+    return hex_digest
+
+def cryptographic_integrity_check(row_count):
+    # 1. Create a matrix to hold row hash
+    hashes = [[0 for col in range(2)] for row in range(row_count)]
+
+    # 2. Use blanket query to pull in all data from prod table and temp table
+    QUERY = "SELECT * FROM top_secret_users"
+
+    # 3. Generate hash on prod table and store to matrix
+    try:
+        conn_prod = psycopg2.connect(**PROD_DB_CONFIG)
+        cursor_prod = conn_prod.cursor()
+        cursor_prod.execute(QUERY)
+        col_count = cursor_prod.fetchone()[0]
+        
+        cursor_prod.execute(QUERY)
+        records = cursor_prod.fetchall()
+        
+        i = 0
+        for row in records:
+            row_text = ""
+            for col in  row:
+                row_text += str(col)
+            
+            row_text.replace(" ", "")
+            hashes[i][0] = hash_function(row_text)
+            i+=1
+
+        conn_prod.close()
+    except Exception as e:
+        print(f" ERROR connecting to PROD: {e}")
+        raise e
+    
+    # 4. Generate hash on temp table and store to matrix
+    try:
+        conn_temp = psycopg2.connect(**TEMP_DB_CONFIG)
+        cursor_temp = conn_temp.cursor()
+        cursor_temp.execute(QUERY)
+        col_count = cursor_temp.fetchone()[0]
+        
+        cursor_temp.execute(QUERY)
+        records = cursor_temp.fetchall()
+        
+        i = 0
+        for row in records:
+            row_text = ""
+            for col in row:
+                row_text += str(col)
+            
+            row_text.replace(" ", "")
+            hashes[i][1] = hash_function(row_text)
+            i+=1
+
+        conn_temp.close()
+    except Exception as e:
+        print(f" ERROR connecting to TEMP: {e}")
+        raise e
+    
+    # 5. Compare hashes
+    for i in range(row_count):
+        if(hashes[i][0] != hashes[i][1]):
+            raise ValueError(f" INTEGRITY FAILURE! Hashes do not match at row {i}")
 
 
 def decide_corruption(**context):
