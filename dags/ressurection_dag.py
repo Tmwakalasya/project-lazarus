@@ -1,15 +1,18 @@
 import os
+from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 import psycopg2
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models.param import Param
 from datetime import datetime
+import json
+import urllib.request
 import hashlib
 
 
 # --- CONFIGURATION ---
-HOST_BACKUP_PATH = "C:/Users/School/Documents/School/CIS4951/project-lazarus/backups"
+HOST_BACKUP_PATH = "/opt/airflow/backups"
 INTERNAL_BACKUP_PATH = "/opt/airflow/backups/integrity_test.sql"
 TEMP_CONTAINER_NAME = "lazarus-temp-db"
 
@@ -38,8 +41,12 @@ TEMP_DB_CONFIG = {
     "password": PROD_PASSWORD,
 }
 
-QUERY = "SELECT COUNT(*) FROM top_secret_users;"
+COUNT_QUERY = "SELECT COUNT(*) FROM public.top_secret_users;"
 
+HASH_QUERY = """
+SELECT md5(string_agg(md5(row(t.*)::text), '' ORDER BY id)) AS table_hash
+FROM public.top_secret_users t;
+"""
 
 # --- PYTHON LOGIC ---
 def check_integrity(**context):
@@ -47,33 +54,41 @@ def check_integrity(**context):
     try:
         conn_prod = psycopg2.connect(**PROD_DB_CONFIG)
         cursor_prod = conn_prod.cursor()
-        cursor_prod.execute(QUERY)
+        cursor_prod.execute(COUNT_QUERY)
         prod_count = cursor_prod.fetchone()[0]
+        cursor_prod.execute(HASH_QUERY)
+        prod_hash = cursor_prod.fetchone()[0]
         print(f"Production rows: {prod_count}")
+        print(f"Production hash: {prod_hash}")
         conn_prod.close()
     except Exception as e:
-        print(f" ERROR connecting to PROD: {e}")
+        print(f"ERROR connecting to PROD: {e}")
         raise e
 
     # 2. Inspect Replica
     try:
         conn_temp = psycopg2.connect(**TEMP_DB_CONFIG)
         cursor_temp = conn_temp.cursor()
-        cursor_temp.execute(QUERY)
+        cursor_temp.execute(COUNT_QUERY)
         temp_count = cursor_temp.fetchone()[0]
+        cursor_temp.execute(HASH_QUERY)
+        temp_hash = cursor_temp.fetchone()[0]
         print(f"Replica rows: {temp_count}")
+        print(f"Replica hash: {temp_hash}")
         conn_temp.close()
     except Exception as e:
-        print(f" ERROR connecting to TEMP: {e}")
+        print(f"ERROR connecting to TEMP: {e}")
         raise e
 
-    # 3. Verify the two replicas
+    # 3. Mathematical verification (counts + checksums)
     if prod_count != temp_count:
-        raise ValueError(f" INTEGRITY FAILURE! Prod: {prod_count} != Temp: {temp_count}")
+        raise ValueError(f"ROW COUNT MISMATCH! Prod={prod_count} Temp={temp_count}")
+    if prod_hash != temp_hash:
+        raise ValueError(f"CHECKSUM MISMATCH! Prod={prod_hash} Temp={temp_hash}")
+    print("Mathematical integrity check passed (row count + checksum).")
+
 
     cryptographic_integrity_check(prod_count)
-
-    print(" Integrity check passed.")
 
 def hash_function(data):
     input_bytes = data.encode('utf-8')
@@ -157,16 +172,69 @@ default_args = {
     "retries": 0
 }
 
+def notify_slack_on_failure(context):
+    webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook:
+        print("SLACK_WEBHOOK_URL not set, skipping Slack notification.")
+        return
+    ti = context.get("task_instance")
+    dag_id = context.get("dag").dag_id if context.get("dag") else "unknown_dag"
+    task_id = ti.task_id if ti else "unknown_task"
+    run_id = context.get("run_id", "unknown_run")
+    exc = context.get("exception")
+    log_url = ti.log_url if ti else ""
+    msg = (
+        f":rotating_light: Lazarus verification failed\n"
+        f"DAG: {dag_id}\n"
+        f"Task: {task_id}\n"
+        f"Run: {run_id}\n"
+        f"Error: {exc}\n"
+        f"Logs: {log_url}"
+)
+
+    data = json.dumps({"text": msg}).encode("utf-8")
+    req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"}, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"Slack webhook status: {resp.status}")
+    except Exception as e:
+        print(f"Failed to send Slack notification: {e}")
+
 with DAG(
         dag_id='project_lazarus_verifier',
         default_args=default_args,
         start_date=datetime(2023, 1, 1),
         schedule_interval=None,
         catchup=False,
+        on_failure_callback=notify_slack_on_failure,
         params={
             "simulate_corruption": Param(False, type="boolean", description="Inject corruption into backup file?"),
         }
 ) as dag:
+
+
+    # 0. Initialize PROD with deterministic test data
+    init_prod_task = BashOperator(
+        task_id="0_init_prod_data",
+        bash_command=(
+            f'PGPASSWORD={PROD_PASSWORD} psql '
+            f'-h postgres-prod '
+            f'-U {PROD_USER} '
+            f'-d {PROD_DBNAME} '
+            f'-v ON_ERROR_STOP=1 '
+            f'-c "'
+            'CREATE TABLE IF NOT EXISTS public.top_secret_users ('
+                'id SERIAL PRIMARY KEY, '
+                'username TEXT NOT NULL, '
+                'role TEXT NOT NULL'
+            '); '
+            'TRUNCATE public.top_secret_users; '
+            "INSERT INTO public.top_secret_users (username, role) VALUES "
+            "('Alice','admin'),('Bob','user'),('Carol','auditor');"
+            '"'
+        )
+    )
 
     # 1. Backup Production
     backup_task = BashOperator(
@@ -200,7 +268,7 @@ with DAG(
             -e POSTGRES_DB={PROD_DBNAME} \
             postgres:13
         ''',
-        trigger_rule='one_success'
+        trigger_rule='none_failed_min_one_success'
     )
 
     wait_task = BashOperator(
@@ -215,9 +283,10 @@ with DAG(
     )
 
     verify_task = PythonOperator(
-        task_id='5_verify_integrity',
-        python_callable=check_integrity
-    )
+    task_id='5_verify_integrity',
+    python_callable=check_integrity,
+    on_failure_callback=notify_slack_on_failure
+)
 
     teardown_task = BashOperator(
         task_id='6_teardown',
@@ -225,15 +294,7 @@ with DAG(
         trigger_rule='all_done'
     )
 
-    backup_task >> branch_task
+    init_prod_task >> backup_task >> branch_task
     branch_task >> sabotage_task >> spin_up_task
     branch_task >> spin_up_task
     spin_up_task >> wait_task >> restore_task >> verify_task >> teardown_task
-
-
-
-
-
-
-
-
