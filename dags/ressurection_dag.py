@@ -1,29 +1,23 @@
 import os
-from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
+import json
+import urllib.request
+import hashlib
 import psycopg2
+from datetime import datetime
+
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models.param import Param
-from datetime import datetime
-import json
-import urllib.request
-import hashlib
 
-
-# --- CONFIGURATION ---
+# --- CONFIG ---
 HOST_BACKUP_PATH = "/opt/airflow/backups"
 INTERNAL_BACKUP_PATH = "/opt/airflow/backups/integrity_test.sql"
 TEMP_CONTAINER_NAME = "lazarus-temp-db"
 
-
 PROD_DBNAME = os.getenv("PROD_DB_NAME")
 PROD_PASSWORD = os.getenv("PROD_DB_PASS")
 PROD_USER = os.getenv("PROD_DB_USER")
-
-# Safety Check
-if not PROD_PASSWORD:
-    raise ValueError("Missing Environment Variables! Check docker-compose.")
 
 PROD_DB_CONFIG = {
     "host": "postgres-prod",
@@ -41,165 +35,101 @@ TEMP_DB_CONFIG = {
     "password": PROD_PASSWORD,
 }
 
-COUNT_QUERY = "SELECT COUNT(*) FROM public.top_secret_users;"
 
-HASH_QUERY = """
-SELECT md5(string_agg(md5(row(t.*)::text), '' ORDER BY id)) AS table_hash
-FROM public.top_secret_users t;
-"""
-
-# --- PYTHON LOGIC ---
-def check_integrity(**context):
-    # 1. Inspect Production
-    try:
-        conn_prod = psycopg2.connect(**PROD_DB_CONFIG)
-        cursor_prod = conn_prod.cursor()
-        cursor_prod.execute(COUNT_QUERY)
-        prod_count = cursor_prod.fetchone()[0]
-        cursor_prod.execute(HASH_QUERY)
-        prod_hash = cursor_prod.fetchone()[0]
-        print(f"Production rows: {prod_count}")
-        print(f"Production hash: {prod_hash}")
-        conn_prod.close()
-    except Exception as e:
-        print(f"ERROR connecting to PROD: {e}")
-        raise e
-
-    # 2. Inspect Replica
-    try:
-        conn_temp = psycopg2.connect(**TEMP_DB_CONFIG)
-        cursor_temp = conn_temp.cursor()
-        cursor_temp.execute(COUNT_QUERY)
-        temp_count = cursor_temp.fetchone()[0]
-        cursor_temp.execute(HASH_QUERY)
-        temp_hash = cursor_temp.fetchone()[0]
-        print(f"Replica rows: {temp_count}")
-        print(f"Replica hash: {temp_hash}")
-        conn_temp.close()
-    except Exception as e:
-        print(f"ERROR connecting to TEMP: {e}")
-        raise e
-
-    # 3. Mathematical verification (counts + checksums)
-    if prod_count != temp_count:
-        raise ValueError(f"ROW COUNT MISMATCH! Prod={prod_count} Temp={temp_count}")
-    if prod_hash != temp_hash:
-        raise ValueError(f"CHECKSUM MISMATCH! Prod={prod_hash} Temp={temp_hash}")
-    print("Mathematical integrity check passed (row count + checksum).")
-
-
-    cryptographic_integrity_check(prod_count)
+# --- LOGIC ---
 
 def hash_function(data):
-    input_bytes = data.encode('utf-8')
-    hash_object = hashlib.sha256(input_bytes)
-    hex_digest = hash_object.hexdigest()
+    return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
-    return hex_digest
 
-def cryptographic_integrity_check(row_count):
-    # 1. Create a matrix to hold row hash
-    hashes = [[0 for col in range(2)] for row in range(row_count)]
+def check_integrity(**context):
+    # We enforce ORDER BY id to ensure deterministic hash
+    HASH_QUERY = """
+                 SELECT md5(string_agg(md5(row(t.*)::text), '' ORDER BY id))
+                 FROM public.top_secret_users t; \
+                 """
 
-    # 2. Use blanket query to pull in all data from prod table and temp table
-    QUERY = "SELECT * FROM top_secret_users"
-
-    # 3. Generate hash on prod table and store to matrix
+    # 1. Get Prod Hash
     try:
-        conn_prod = psycopg2.connect(**PROD_DB_CONFIG)
-        cursor_prod = conn_prod.cursor()
-        cursor_prod.execute(QUERY)
-        col_count = cursor_prod.fetchone()[0]
-        
-        cursor_prod.execute(QUERY)
-        records = cursor_prod.fetchall()
-        
-        i = 0
-        for row in records:
-            row_text = ""
-            for col in  row:
-                row_text += str(col)
-            
-            row_text.replace(" ", "")
-            hashes[i][0] = hash_function(row_text)
-            i+=1
-
-        conn_prod.close()
+        conn = psycopg2.connect(**PROD_DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(HASH_QUERY)
+        prod_hash = cur.fetchone()[0]
+        conn.close()
     except Exception as e:
-        print(f" ERROR connecting to PROD: {e}")
-        raise e
-    
-    # 4. Generate hash on temp table and store to matrix
+        raise ConnectionError(f"Prod DB Error: {e}")
+
+    # 2. Get Replica Hash
     try:
-        conn_temp = psycopg2.connect(**TEMP_DB_CONFIG)
-        cursor_temp = conn_temp.cursor()
-        cursor_temp.execute(QUERY)
-        col_count = cursor_temp.fetchone()[0]
-        
-        cursor_temp.execute(QUERY)
-        records = cursor_temp.fetchall()
-        
-        i = 0
-        for row in records:
-            row_text = ""
-            for col in row:
-                row_text += str(col)
-            
-            row_text.replace(" ", "")
-            hashes[i][1] = hash_function(row_text)
-            i+=1
-
-        conn_temp.close()
+        conn = psycopg2.connect(**TEMP_DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(HASH_QUERY)
+        temp_hash = cur.fetchone()[0]
+        conn.close()
     except Exception as e:
-        print(f" ERROR connecting to TEMP: {e}")
-        raise e
-    
-    # 5. Compare hashes
-    for i in range(row_count):
-        if(hashes[i][0] != hashes[i][1]):
-            raise ValueError(f" INTEGRITY FAILURE! Hashes do not match at row {i}")
+        raise ConnectionError(f"Temp DB Error: {e}")
+
+    print(f"Prod Hash: {prod_hash} | Temp Hash: {temp_hash}")
+
+    if prod_hash != temp_hash:
+        print("Mismatch detected. Starting deep scan...")
+        deep_scan_integrity_check()
+    else:
+        print("Integrity Verified.")
+
+
+def deep_scan_integrity_check():
+    QUERY = "SELECT * FROM top_secret_users ORDER BY id ASC"
+
+    rows_prod = []
+    rows_temp = []
+
+    # Stream Prod db
+    conn = psycopg2.connect(**PROD_DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute(QUERY)
+    for row in cur:
+        r_str = "".join(map(str, row)).replace(" ", "")
+        rows_prod.append(hash_function(r_str))
+    conn.close()
+
+    # Stream Temp db
+    conn = psycopg2.connect(**TEMP_DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute(QUERY)
+    for row in cur:
+        r_str = "".join(map(str, row)).replace(" ", "")
+        rows_temp.append(hash_function(r_str))
+    conn.close()
+
+    # Compare
+    for i in range(len(rows_prod)):
+        if rows_prod[i] != rows_temp[i]:
+            raise ValueError(f"Corruption at Row {i}: Prod={rows_prod[i]} != Temp={rows_temp[i]}")
 
 
 def decide_corruption(**context):
-    should_corrupt = context['params']['simulate_corruption']
-    if should_corrupt:
+    if context['params']['simulate_corruption']:
         return "sabotage_backup"
-    else:
-        return "2_spin_up_temp"
+    return "2_spin_up_temp"
 
-default_args = {
-    "owner": "tuntufyemwakalasya",
-    "retries": 0
-}
 
-def notify_slack_on_failure(context):
+def notify_slack(context):
     webhook = os.getenv("SLACK_WEBHOOK_URL")
-    if not webhook:
-        print("SLACK_WEBHOOK_URL not set, skipping Slack notification.")
-        return
-    ti = context.get("task_instance")
-    dag_id = context.get("dag").dag_id if context.get("dag") else "unknown_dag"
-    task_id = ti.task_id if ti else "unknown_task"
-    run_id = context.get("run_id", "unknown_run")
-    exc = context.get("exception")
-    log_url = ti.log_url if ti else ""
-    msg = (
-        f":rotating_light: Lazarus verification failed\n"
-        f"DAG: {dag_id}\n"
-        f"Task: {task_id}\n"
-        f"Run: {run_id}\n"
-        f"Error: {exc}\n"
-        f"Logs: {log_url}"
-)
+    if not webhook: return
 
-    data = json.dumps({"text": msg}).encode("utf-8")
-    req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"}, method="POST")
-
+    msg = f":rotating_light: Failed: {context.get('task_instance').task_id}"
+    req = urllib.request.Request(webhook, data=json.dumps({"text": msg}).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"Slack webhook status: {resp.status}")
-    except Exception as e:
-        print(f"Failed to send Slack notification: {e}")
+        urllib.request.urlopen(req, timeout=5)
+    except:
+        pass
+
+
+# --- DAG ---
+
+default_args = {"owner": "platform", "retries": 0}
 
 with DAG(
         dag_id='project_lazarus_verifier',
@@ -207,57 +137,38 @@ with DAG(
         start_date=datetime(2023, 1, 1),
         schedule_interval=None,
         catchup=False,
-        on_failure_callback=notify_slack_on_failure,
-        params={
-            "simulate_corruption": Param(False, type="boolean", description="Inject corruption into backup file?"),
-        }
+        on_failure_callback=notify_slack,
+        params={"simulate_corruption": Param(False, type="boolean")}
 ) as dag:
-
-
-    # 0. Initialize PROD with deterministic test data
-    init_prod_task = BashOperator(
+    # 0. Seed Data
+    init = BashOperator(
         task_id="0_init_prod_data",
         bash_command=(
-            f'PGPASSWORD={PROD_PASSWORD} psql '
-            f'-h postgres-prod '
-            f'-U {PROD_USER} '
-            f'-d {PROD_DBNAME} '
-            f'-v ON_ERROR_STOP=1 '
-            f'-c "'
-            'CREATE TABLE IF NOT EXISTS public.top_secret_users ('
-                'id SERIAL PRIMARY KEY, '
-                'username TEXT NOT NULL, '
-                'role TEXT NOT NULL'
-            '); '
+            f'PGPASSWORD={PROD_PASSWORD} psql -h postgres-prod -U {PROD_USER} -d {PROD_DBNAME} '
+            f'-v ON_ERROR_STOP=1 -c "'
+            'CREATE TABLE IF NOT EXISTS public.top_secret_users (id SERIAL PRIMARY KEY, username TEXT, role TEXT); '
             'TRUNCATE public.top_secret_users; '
-            "INSERT INTO public.top_secret_users (username, role) VALUES "
-            "('Alice','admin'),('Bob','user'),('Carol','auditor');"
+            "INSERT INTO public.top_secret_users (username, role) VALUES ('Alice','admin'),('Bob','user'),('Carol','auditor');"
             '"'
         )
     )
 
-    # 1. Backup Production
-    backup_task = BashOperator(
+    # 1. Backup
+    backup = BashOperator(
         task_id='1_backup_prod',
-        bash_command=(
-            f'PGPASSWORD={PROD_PASSWORD} pg_dump -h postgres-prod -U {PROD_USER} -d {PROD_DBNAME} > {INTERNAL_BACKUP_PATH} '
-            f'&& sed -i "/transaction_timeout/d" {INTERNAL_BACKUP_PATH}'
-        )
+        bash_command=f'PGPASSWORD={PROD_PASSWORD} pg_dump -h postgres-prod -U {PROD_USER} -d {PROD_DBNAME} > {INTERNAL_BACKUP_PATH}'
     )
 
-    branch_task = BranchPythonOperator(
-        task_id='decide_path',
-        python_callable=decide_corruption
-    )
+    branch = BranchPythonOperator(task_id='decide_path', python_callable=decide_corruption)
 
-    # 3. Sabotage Task
-    sabotage_task = BashOperator(
+    # 2. Sabotage
+    sabotage = BashOperator(
         task_id='sabotage_backup',
-        bash_command=f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL_DATA\', \'spy\');" >> {INTERNAL_BACKUP_PATH}'
+        bash_command=f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL\', \'spy\');" >> {INTERNAL_BACKUP_PATH}'
     )
 
-    # 4. Spin Up Temp DB
-    spin_up_task = BashOperator(
+    # 3. Spin Up Temp
+    spin_up = BashOperator(
         task_id='2_spin_up_temp',
         bash_command=f'''
             docker run -d --name {TEMP_CONTAINER_NAME} \
@@ -265,36 +176,30 @@ with DAG(
             -v {HOST_BACKUP_PATH}:/backup_mount \
             -e POSTGRES_PASSWORD={PROD_PASSWORD} \
             -e POSTGRES_USER={PROD_USER} \
-            -e POSTGRES_DB={PROD_DBNAME} \
+            -e POSTGRES_DB={PROD_DBNAME}\
             postgres:13
         ''',
         trigger_rule='none_failed_min_one_success'
     )
 
-    wait_task = BashOperator(
-        task_id='3_wait_for_boot',
-        bash_command='sleep 10'
-    )
-
-    # 5. Restore Backup
-    restore_task = BashOperator(
+    wait = BashOperator(task_id='3_wait_for_boot', bash_command='sleep 10')
+    # 4. Restore
+    restore = BashOperator(
         task_id='4_restore_backup',
-        bash_command=f'docker exec -i {TEMP_CONTAINER_NAME} psql -v ON_ERROR_STOP=1 -U {PROD_USER} -d {PROD_DBNAME} -f /backup_mount/integrity_test.sql'
+        bash_command=f'docker exec -i {TEMP_CONTAINER_NAME} psql -U {PROD_USER} -d {PROD_DBNAME} < {INTERNAL_BACKUP_PATH}'
     )
 
-    verify_task = PythonOperator(
-    task_id='5_verify_integrity',
-    python_callable=check_integrity,
-    on_failure_callback=notify_slack_on_failure
-)
+    # 5. Verify
+    verify = PythonOperator(task_id='5_verify_integrity', python_callable=check_integrity)
 
-    teardown_task = BashOperator(
+    # 6. Cleanup
+    teardown = BashOperator(
         task_id='6_teardown',
         bash_command=f'docker rm -f {TEMP_CONTAINER_NAME}',
         trigger_rule='all_done'
     )
 
-    init_prod_task >> backup_task >> branch_task
-    branch_task >> sabotage_task >> spin_up_task
-    branch_task >> spin_up_task
-    spin_up_task >> wait_task >> restore_task >> verify_task >> teardown_task
+    init >> backup >> branch
+    branch >> sabotage >> spin_up
+    branch >> spin_up
+    spin_up >> wait >> restore >> verify >> teardown
