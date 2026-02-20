@@ -100,9 +100,6 @@ docker-compose up -d --build
 - Watch the fireworks: The "Sabotage" task will inject data, and the "Verify" task will raise an exception if it successfully detects the mismatch.
 
 ## What's Next
-
-- **Cryptographic Hashing:** Move beyond row counts to SHA-256 checksums of critical tables
-- **Alerting Integration:** Slack/PagerDuty webhooks for automated incident response
 - **Multi-DB Support:** Extend beyond Postgres to MySQL, MongoDB
 - **Performance Metrics:** Track restore time as a reliability KPI
 
