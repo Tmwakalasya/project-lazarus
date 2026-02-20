@@ -70,6 +70,7 @@ No credentials are hardcoded.
 ### Prerequisites
 
 - Docker & Docker Compose
+- Docker & Docker Compose (macOS users can use OrbStack as a lightweight, drop-in replacement for Docker Desktop to significantly reduce CPU/RAM overhead).
 
 ### Setup
 
@@ -98,6 +99,12 @@ docker-compose up -d --build
 - Navigate to http://localhost:8080 (User/Pass: `admin/admin` - check standalone logs if different).
 - Trigger the `project_lazarus_verifier` DAG.
 - Watch the fireworks: The "Sabotage" task will inject data, and the "Verify" task will raise an exception if it successfully detects the mismatch.
+
+
+5. **Cleanup the pipeline**
+```bash
+    docker-compose down -v
+```
 
 ## What's Next
 - **Multi-DB Support:** Extend beyond Postgres to MySQL, MongoDB
