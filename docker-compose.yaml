@@ -46,6 +46,7 @@ services:
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
       - ./backups:/opt/airflow/backups
+      - ./db_strategies:/opt/airflow/db_strategies
       - /var/run/docker.sock:/var/run/docker.sock
     user: root
     depends_on:

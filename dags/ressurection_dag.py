@@ -1,6 +1,7 @@
 import os
 import json
 import urllib.request
+import urllib.error
 import hashlib
 from datetime import datetime
 from abc import ABC, abstractmethod
@@ -12,70 +13,9 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models.param import Param
 
-
-# ==========================================
-# 1. ABSTRACTION LAYER (Database Adapters)
-# ==========================================
-
-@dataclass(frozen=True)
-class ConnectionConfig:
-    """Shared connection payload for all adapters."""
-    host: str
-    port: int | None = None
-    username: str | None = None
-    password: str | None = None
-    database: str | None = None
-    extra: Mapping[str, Any] | None = None
-
-
-class DBStrategy(ABC):
-    """Contract every database adapter must satisfy."""
-
-    @abstractmethod
-    def connect(self, config: ConnectionConfig) -> None:
-        pass
-
-    @abstractmethod
-    def execute(self, query: Any) -> Sequence[Any]:
-        pass
-
-    @abstractmethod
-    def disconnect(self) -> None:
-        pass
-
-
-class PostgreSQLConnector(DBStrategy):
-    """PostgreSQL adapter using psycopg2."""
-
-    def __init__(self) -> None:
-        self._conn: Any | None = None
-
-    def connect(self, config: ConnectionConfig) -> None:
-        import psycopg2
-        self._conn = psycopg2.connect(
-            host=config.host,
-            port=config.port or 5432,
-            user=config.username,
-            password=config.password,
-            dbname=config.database,
-            **(dict(config.extra) if config.extra else {}),
-        )
-
-    def execute(self, query: Any) -> Sequence[Any]:
-        if self._conn is None:
-            raise RuntimeError("PostgreSQLConnector is not connected.")
-        with self._conn.cursor() as cursor:
-            cursor.execute(query)
-            if cursor.description is None:
-                self._conn.commit()
-                return []
-            rows = cursor.fetchall()
-            return rows
-
-    def disconnect(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+# Add the project root to sys.path so we can import db_strategies when running in Airflow
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ==========================================
@@ -106,6 +46,7 @@ temp_config = ConnectionConfig(
     database=PROD_DBNAME
 )
 
+db_strategy = PostgreSQLConnector()
 
 # ==========================================
 # 3. VERIFICATION LOGIC
@@ -168,7 +109,7 @@ def notify_slack(context):
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
         urllib.request.urlopen(req, timeout=5)
-    except:
+    except urllib.error.URLError:
         pass
 
 
@@ -201,27 +142,19 @@ with DAG(
 
     backup = BashOperator(
         task_id='1_backup_prod',
-        bash_command=f'PGPASSWORD={PROD_PASSWORD} pg_dump -h postgres-prod -U {PROD_USER} -d {PROD_DBNAME} > {INTERNAL_BACKUP_PATH}'
+        bash_command=db_strategy.get_backup_command(prod_config, INTERNAL_BACKUP_PATH)
     )
 
     branch = BranchPythonOperator(task_id='decide_path', python_callable=decide_corruption)
 
     sabotage = BashOperator(
         task_id='sabotage_backup',
-        bash_command=f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL\', \'spy\');" >> {INTERNAL_BACKUP_PATH}'
+        bash_command=db_strategy.get_sabotage_command(INTERNAL_BACKUP_PATH)
     )
 
     spin_up = BashOperator(
         task_id='2_spin_up_temp',
-        bash_command=f'''
-            docker run -d --name {TEMP_CONTAINER_NAME} \
-            --network project-lazarus_default \
-            -v {HOST_BACKUP_PATH}:/backup_mount \
-            -e POSTGRES_PASSWORD={PROD_PASSWORD} \
-            -e POSTGRES_USER={PROD_USER} \
-            -e POSTGRES_DB={PROD_DBNAME} \
-            postgres:13
-        ''',
+        bash_command=db_strategy.get_docker_run_command(temp_config, TEMP_CONTAINER_NAME, HOST_BACKUP_PATH),
         trigger_rule='none_failed_min_one_success'
     )
 
@@ -229,7 +162,7 @@ with DAG(
 
     restore = BashOperator(
         task_id='4_restore_backup',
-        bash_command=f'docker exec -i {TEMP_CONTAINER_NAME} psql -U {PROD_USER} -d {PROD_DBNAME} < {INTERNAL_BACKUP_PATH}'
+        bash_command=db_strategy.get_restore_command(temp_config, TEMP_CONTAINER_NAME, INTERNAL_BACKUP_PATH)
     )
 
     verify = PythonOperator(task_id='5_verify_integrity', python_callable=check_integrity)

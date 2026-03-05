@@ -38,6 +38,26 @@ class DBStrategy(ABC):
     def disconnect(self) -> None:
         """Close all open resources."""
 
+    @abstractmethod
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+        """Return the bash command to backup the database."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_sabotage_command(self, backup_path: str) -> str:
+        """Return the bash command to inject corruption into the backup."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+        """Return the bash command to spin up an ephemeral database container."""
+        raise NotImplementedError()
+        
+    @abstractmethod
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+        """Return the bash command to restore the database in the container."""
+        raise NotImplementedError()
+
 
 class PostgreSQLConnector(DBStrategy):
     """PostgreSQL adapter using psycopg2."""
@@ -73,6 +93,27 @@ class PostgreSQLConnector(DBStrategy):
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+        return f'PGPASSWORD={config.password} pg_dump -h {config.host} -U {config.username} -d {config.database} > {backup_path}'
+
+    def get_sabotage_command(self, backup_path: str) -> str:
+        return f'echo "INSERT INTO public.top_secret_users (username, role) VALUES (\'EVIL\', \'spy\');" >> {backup_path}'
+
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+        return f'''
+            docker run -d --name {container_name} \\
+            --network project-lazarus_default \\
+            -v {host_backup_path}:/backup_mount \\
+            -e POSTGRES_PASSWORD={config.password} \\
+            -e POSTGRES_USER={config.username} \\
+            -e POSTGRES_DB={config.database} \\
+            postgres:13
+        '''
+
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+        return f'docker exec -i {container_name} psql -U {config.username} -d {config.database} < {internal_backup_path}'
+
 
 
 class MySQLConnector(DBStrategy):
@@ -112,6 +153,25 @@ class MySQLConnector(DBStrategy):
             self._conn.close()
             self._conn = None
 
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+        return f'mysqldump -h {config.host} -u {config.username} -p{config.password} {config.database} > {backup_path}'
+        
+    def get_sabotage_command(self, backup_path: str) -> str:
+        return f'echo "INSERT INTO top_secret_users (username, role) VALUES (\'EVIL\', \'spy\');" >> {backup_path}'
+
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+        return f'''
+            docker run -d --name {container_name} \\
+            --network project-lazarus_default \\
+            -v {host_backup_path}:/backup_mount \\
+            -e MYSQL_ROOT_PASSWORD={config.password} \\
+            -e MYSQL_DATABASE={config.database} \\
+            mysql:8.0
+        '''
+
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+        return f'docker exec -i {container_name} mysql -u root -p{config.password} {config.database} < {internal_backup_path}'
+
 
 class SnowflakeConnector(DBStrategy):
     """Snowflake adapter using snowflake-connector-python."""
@@ -150,6 +210,18 @@ class SnowflakeConnector(DBStrategy):
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+         raise NotImplementedError("Backup command not implemented for Snowflake")
+
+    def get_sabotage_command(self, backup_path: str) -> str:
+         raise NotImplementedError("Sabotage command not implemented for Snowflake")
+
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+         raise NotImplementedError("Docker run command not implemented for Snowflake")
+        
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+         raise NotImplementedError("Restore command not implemented for Snowflake")
 
 
 class MongoDBConnector(DBStrategy):
@@ -221,6 +293,28 @@ class MongoDBConnector(DBStrategy):
             self._client = None
             self._db = None
 
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+         # MongoDB dumps to a directory rather than a file
+         return f'mongodump --host {config.host} --port {config.port or 27017} --username {config.username} --password {config.password} --db {config.database} --out {backup_path}'
+
+    def get_sabotage_command(self, backup_path: str) -> str:
+         # This is a bit complex for a BSON dump but we'll create a placeholder
+         return f'echo "Mock MongoDB BSON modification" && exit 1'
+
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+         return f'''
+            docker run -d --name {container_name} \\
+            --network project-lazarus_default \\
+            -v {host_backup_path}:/backup_mount \\
+            -e MONGO_INITDB_ROOT_USERNAME={config.username} \\
+            -e MONGO_INITDB_ROOT_PASSWORD={config.password} \\
+            mongo:latest
+         '''
+        
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+         return f'docker exec -i {container_name} mongorestore --username {config.username} --password {config.password} --db {config.database} {internal_backup_path}/{config.database}'
+
+
 
 class CassandraConnector(DBStrategy):
     """Cassandra adapter using cassandra-driver."""
@@ -264,3 +358,15 @@ class CassandraConnector(DBStrategy):
         if self._cluster is not None:
             self._cluster.shutdown()
             self._cluster = None
+
+    def get_backup_command(self, config: ConnectionConfig, backup_path: str) -> str:
+         raise NotImplementedError("Backup command not implemented for Cassandra")
+
+    def get_sabotage_command(self, backup_path: str) -> str:
+         raise NotImplementedError("Sabotage command not implemented for Cassandra")
+
+    def get_docker_run_command(self, config: ConnectionConfig, container_name: str, host_backup_path: str) -> str:
+         raise NotImplementedError("Docker run command not implemented for Cassandra")
+        
+    def get_restore_command(self, config: ConnectionConfig, container_name: str, internal_backup_path: str) -> str:
+         raise NotImplementedError("Restore command not implemented for Cassandra")
