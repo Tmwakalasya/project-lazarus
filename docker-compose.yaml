@@ -53,5 +53,17 @@ services:
       postgres-airflow:
         condition: service_healthy
 
+  # 4. Dashboard (Next.js)
+  dashboard:
+    build: ./dashboard
+    container_name: lazarus-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://airflow:airflow@postgres-airflow:5432/airflow
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+
 volumes:
   postgres_data:

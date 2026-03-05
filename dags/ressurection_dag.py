@@ -16,7 +16,7 @@ from airflow.models.param import Param
 # Add the project root to sys.path so we can import db_strategies when running in Airflow
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from db_strategies.DBStrategies import ConnectionConfig, PostgreSQLConnector
 
 # ==========================================
 # 2. CONFIGURATION
@@ -46,6 +46,14 @@ temp_config = ConnectionConfig(
     database=PROD_DBNAME
 )
 
+telemetry_config = ConnectionConfig(
+    host="postgres-airflow",
+    port=5432,
+    username="airflow",
+    password="airflow",
+    database="airflow"
+)
+
 db_strategy = PostgreSQLConnector()
 
 # ==========================================
@@ -72,6 +80,9 @@ def check_integrity(**context):
 
         rows_prod = prod_db.execute(QUERY)
         rows_temp = temp_db.execute(QUERY)
+        
+        # Save to XCom for telemetry
+        context['ti'].xcom_push(key='total_rows', value=len(rows_prod))
 
         # 1. Fast-fail on row count mismatches (The boundary check)
         if len(rows_prod) != len(rows_temp):
@@ -112,6 +123,70 @@ def notify_slack(context):
     except urllib.error.URLError:
         pass
 
+
+def emit_telemetry(**context):
+    """Gathers DAG run info and writes to the telemetry table."""
+    conn = PostgreSQLConnector()
+    try:
+        conn.connect(telemetry_config)
+        
+        # Ensure table exists
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS lazarus_telemetry (
+                id SERIAL PRIMARY KEY,
+                run_id TEXT,
+                timestamp TIMESTAMP,
+                status TEXT,
+                sabotage_active BOOLEAN,
+                time_to_restore_seconds NUMERIC,
+                total_rows_verified INTEGER,
+                backup_size_mb NUMERIC
+            );
+        ''')
+        
+        dag_run = context['dag_run']
+        tis = dag_run.get_task_instances()
+        
+        run_id = dag_run.run_id
+        timestamp = datetime.utcnow().isoformat()
+        
+        sabotage_ti = next((ti for ti in tis if ti.task_id == 'sabotage_backup'), None)
+        sabotage_active = sabotage_ti is not None and sabotage_ti.state == 'success'
+        
+        restore_ti = next((ti for ti in tis if ti.task_id == '4_restore_backup'), None)
+        time_to_restore = restore_ti.duration if restore_ti and restore_ti.duration else 0.0
+        
+        verify_ti = next((ti for ti in tis if ti.task_id == '5_verify_integrity'), None)
+        # Determine overall status based on verify task state
+        if verify_ti and verify_ti.state == 'success':
+            status = 'Success'
+        elif verify_ti and verify_ti.state == 'failed':
+            status = 'Failed_Verify'
+        else:
+            status = 'Failed_Infrastructure'
+        
+        try:
+            total_rows = context['ti'].xcom_pull(task_ids='5_verify_integrity', key='total_rows') or 0
+        except KeyError:
+            total_rows = 0
+            
+        try:
+            size_bytes = os.path.getsize(INTERNAL_BACKUP_PATH)
+            backup_size_mb = size_bytes / (1024 * 1024)
+        except OSError:
+            backup_size_mb = 0.0
+            
+        insert_query = f'''
+            INSERT INTO lazarus_telemetry 
+            (run_id, timestamp, status, sabotage_active, time_to_restore_seconds, total_rows_verified, backup_size_mb)
+            VALUES 
+            ('{run_id}', '{timestamp}', '{status}', {str(sabotage_active).lower()}, {time_to_restore}, {total_rows}, {backup_size_mb});
+        '''
+        conn.execute(insert_query)
+        print("Telemetry successfully recorded.")
+
+    finally:
+        conn.disconnect()
 
 # ==========================================
 # 4. DAG DEFINITION
@@ -172,8 +247,14 @@ with DAG(
         bash_command=f'docker rm -f {TEMP_CONTAINER_NAME}',
         trigger_rule='all_done'
     )
+    
+    telemetry = PythonOperator(
+        task_id='7_emit_telemetry',
+        python_callable=emit_telemetry,
+        trigger_rule='all_done'
+    )
 
     init >> backup >> branch
     branch >> sabotage >> spin_up
     branch >> spin_up
-    spin_up >> wait >> restore >> verify >> teardown
+    spin_up >> wait >> restore >> verify >> teardown >> telemetry
